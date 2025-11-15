@@ -2,63 +2,62 @@
 %default RATINGS '/user/root/input/films_tsv/ratings.tsv';
 %default OUTPUT '/user/root/pigout/films';
 
--- Schémas TSV issus d'un pré-traitement JSON Lines (jq)
-films = LOAD '$FILMS' USING PigStorage('\t') AS (
-    movieid:int,
-    title:chararray,
-    genres:chararray   -- pipe-separated, e.g., "Action|Comedy"
+-- Chargement TSV issus d'une conversion JSON préalable
+films_raw = LOAD '$FILMS' USING PigStorage('\t') AS (
+    film_id:int,
+    titre:chararray,
+    genres:chararray  -- "Action|Comedy|..."
 );
 
-ratings = LOAD '$RATINGS' USING PigStorage('\t') AS (
-    user_id:int,
-    name:chararray,
-    gender:chararray,
+ratings_raw = LOAD '$RATINGS' USING PigStorage('\t') AS (
+    usr_id:int,
+    nom:chararray,
+    sexe:chararray,
     age:int,
-    occupation:chararray,
-    movieid:int,
-    rating:int,
+    job:chararray,
+    film_id:int,
+    note:int,
     ts:long
 );
 
--- Une ligne par (movieid, titre, genre)
-film_genres = FOREACH films GENERATE
-    movieid,
-    title,
-    FLATTEN(TOKENIZE(REPLACE(genres, '\\|', ' '))) AS genre:chararray;
+-- Explosion des genres : une ligne par genre
+genres_exp = FOREACH films_raw GENERATE
+    film_id,
+    titre,
+    FLATTEN(TOKENIZE(REPLACE(genres,'\\|',' '))) AS genre:chararray;
+genres_valid = FILTER genres_exp BY genre IS NOT NULL AND SIZE(genre)>0;
 
-film_genres_clean = FILTER film_genres BY genre IS NOT NULL AND SIZE(genre) > 0;
+-- Statistiques par film (moyenne / volume d'avis)
+grp_film = GROUP ratings_raw BY film_id;
+film_stats = FOREACH grp_film GENERATE group AS film_id, AVG(ratings_raw.note) AS note_moy, COUNT(ratings_raw) AS nb_notes;
+join_top = JOIN film_stats BY film_id, films_raw BY film_id;
+films_rank_base = FOREACH join_top GENERATE films_raw::film_id AS film_id,
+                                                                                 films_raw::titre AS titre,
+                                                                                 film_stats::note_moy AS note_moy,
+                                                                                 film_stats::nb_notes AS nb_notes;
+films_best = ORDER films_rank_base BY note_moy DESC, nb_notes DESC, titre ASC;
+STORE films_best INTO '$OUTPUT/top_movies' USING PigStorage('\t');
 
--- Meilleurs films par note moyenne et nombre d'avis
-r_by_movie = GROUP ratings BY movieid;
-movie_stats = FOREACH r_by_movie GENERATE group AS movieid, AVG(ratings.rating) AS avg_rating, COUNT(ratings) AS rating_count;
-ms_join = JOIN movie_stats BY movieid, films BY movieid;
-top_movies = FOREACH ms_join GENERATE films::movieid AS movieid,
-                                         films::title AS title,
-                                         movie_stats::avg_rating AS avg_rating,
-                                         movie_stats::rating_count AS rating_count;
-ordered_top = ORDER top_movies BY avg_rating DESC, rating_count DESC, title ASC;
-STORE ordered_top INTO '$OUTPUT/top_movies' USING PigStorage('\t');
+-- Comptage de films uniques par genre
+genre_uniques = DISTINCT (FOREACH genres_valid GENERATE genre, film_id);
+grp_genre_films = GROUP genre_uniques BY genre;
+genre_stats = FOREACH grp_genre_films GENERATE group AS genre, COUNT(genre_uniques) AS nb_films;
+genre_stats_ord = ORDER genre_stats BY nb_films DESC, genre ASC;
+STORE genre_stats_ord INTO '$OUTPUT/genre_count' USING PigStorage('\t');
 
--- Nombre de films uniques par genre
-distinct_movie_genre = DISTINCT (FOREACH film_genres_clean GENERATE genre, movieid);
-by_genre_movies = GROUP distinct_movie_genre BY genre;
-genre_count = FOREACH by_genre_movies GENERATE group AS genre, COUNT(distinct_movie_genre) AS movie_count;
-ordered_genre_count = ORDER genre_count BY movie_count DESC, genre ASC;
-STORE ordered_genre_count INTO '$OUTPUT/genre_count' USING PigStorage('\t');
+-- Moyenne de note par genre
+rating_genre_join = JOIN ratings_raw BY film_id, genres_valid BY film_id;
+grp_genre_notes = GROUP rating_genre_join BY genres_valid::genre;
+genre_notes = FOREACH grp_genre_notes GENERATE group AS genre,
+                                                                                 AVG(rating_genre_join.ratings_raw::note) AS note_moy,
+                                                                                 COUNT(rating_genre_join) AS nb_entries;
+genre_notes_ord = ORDER genre_notes BY note_moy DESC, nb_entries DESC, genre ASC;
+STORE genre_notes_ord INTO '$OUTPUT/genre_avg' USING PigStorage('\t');
 
--- Note moyenne par genre
-ratings_with_genre = JOIN ratings BY movieid, film_genres_clean BY movieid;
-by_genre_r = GROUP ratings_with_genre BY film_genres_clean::genre;
-genre_avg = FOREACH by_genre_r GENERATE group AS genre,
-                                      AVG(ratings_with_genre.ratings::rating) AS avg_rating,
-                                      COUNT(ratings_with_genre) AS rating_count;
-ordered_genre_avg = ORDER genre_avg BY avg_rating DESC, rating_count DESC, genre ASC;
-STORE ordered_genre_avg INTO '$OUTPUT/genre_avg' USING PigStorage('\t');
-
--- Note moyenne par (genre, sexe)
-by_genre_gender = GROUP ratings_with_genre BY (film_genres_clean::genre, ratings::gender);
-genre_gender_avg = FOREACH by_genre_gender GENERATE
-    FLATTEN(group) AS (genre, gender),
-    AVG(ratings_with_genre.ratings::rating) AS avg_rating,
-    COUNT(ratings_with_genre) AS rating_count;
-STORE genre_gender_avg INTO '$OUTPUT/genre_gender_avg' USING PigStorage('\t');
+-- Moyenne par couple (genre, sexe utilisateur)
+grp_genre_sexe = GROUP rating_genre_join BY (genres_valid::genre, ratings_raw::sexe);
+genre_sexe_stats = FOREACH grp_genre_sexe GENERATE
+    FLATTEN(group) AS (genre, sexe),
+    AVG(rating_genre_join.ratings_raw::note) AS note_moy,
+    COUNT(rating_genre_join) AS nb_entries;
+STORE genre_sexe_stats INTO '$OUTPUT/genre_gender_avg' USING PigStorage('\t');

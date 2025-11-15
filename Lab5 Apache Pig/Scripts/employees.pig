@@ -3,70 +3,72 @@
 %default OUTPUT '/user/root/pigout/employees';
 %default HIGH_SAL 3000;
 
--- Schémas : employés (7 colonnes) et départements (2 colonnes)
-employees = LOAD '$EMPLOYEES' USING PigStorage('\t') AS (
-    id:int,
-    full_name:chararray,
-    gender:chararray,
-    salary:int,
+-- Chargement des deux jeux (employés: 7 champs / départements: 2 champs)
+emp_src = LOAD '$EMPLOYEES' USING PigStorage('\t') AS (
+    emp_id:int,
+    nom_complet:chararray,
+    sexe:chararray,
+    salaire:int,
     depno:int,
-    city:chararray,
-    country:chararray
+    ville:chararray,
+    pays:chararray
 );
 
-departments = LOAD '$DEPARTMENTS' USING PigStorage('\t') AS (
+dept_src = LOAD '$DEPARTMENTS' USING PigStorage('\t') AS (
     depno:int,
-    dep_name:chararray
+    dep_nom:chararray
 );
 
--- Salaire moyen par département
-emp_by_dep = GROUP employees BY depno;
-avg_sal = FOREACH emp_by_dep GENERATE group AS depno, AVG(employees.salary) AS avg_salary;
-STORE avg_sal INTO '$OUTPUT/avg_sal' USING PigStorage('\t');
+-- Pré-projections réutilisables
+emp_basic = FOREACH emp_src GENERATE emp_id, depno, salaire, ville, sexe, nom_complet;
+dept_only = FOREACH dept_src GENERATE depno, dep_nom;
 
--- Nombre d'employés par département
-count_dep = FOREACH emp_by_dep GENERATE group AS depno, COUNT(employees) AS emp_count;
-STORE count_dep INTO '$OUTPUT/count_dep' USING PigStorage('\t');
+-- Agrégations par département (regroupement unique)
+grp_dep = GROUP emp_basic BY depno;
+dep_avg = FOREACH grp_dep GENERATE group AS depno, AVG(emp_basic.salaire) AS sal_moyen;
+STORE dep_avg INTO '$OUTPUT/avg_sal' USING PigStorage('\t');
 
--- Employés à salaire élevé (> $HIGH_SAL)
-high_sal = FILTER employees BY salary > $HIGH_SAL;
-STORE high_sal INTO '$OUTPUT/high_sal' USING PigStorage('\t');
+dep_count = FOREACH grp_dep GENERATE group AS depno, COUNT(emp_basic) AS nb_emp;
+STORE dep_count INTO '$OUTPUT/count_dep' USING PigStorage('\t');
 
--- Meilleur salaire par département (employés au salaire max de leur département)
-max_sal_by_dep = FOREACH emp_by_dep GENERATE group AS depno, MAX(employees.salary) AS max_salary;
-emp_max_join = JOIN employees BY depno, max_sal_by_dep BY depno;
-top_dep = FILTER emp_max_join BY employees::salary == max_sal_by_dep::max_salary;
-top_dep_proj = FOREACH top_dep GENERATE employees::depno AS depno,
-                                   employees::id AS id,
-                                   employees::full_name AS full_name,
-                                   employees::salary AS salary;
-STORE top_dep_proj INTO '$OUTPUT/top_dep' USING PigStorage('\t');
+-- Filtrage des salaires élevés
+sal_haut = FILTER emp_basic BY salaire > $HIGH_SAL;
+STORE sal_haut INTO '$OUTPUT/high_sal' USING PigStorage('\t');
 
--- Départements sans employés
-emp_depnos = FOREACH employees GENERATE depno;
-emp_depnos_distinct = DISTINCT emp_depnos;
-left_join = JOIN departments BY depno LEFT, emp_depnos_distinct BY depno;
-dep_empty = FILTER left_join BY emp_depnos_distinct::depno IS NULL;
-dep_empty_proj = FOREACH dep_empty GENERATE departments::depno AS depno, departments::dep_name AS dep_name;
-STORE dep_empty_proj INTO '$OUTPUT/dep_empty' USING PigStorage('\t');
+-- Extraction des top salaires par département
+dep_max = FOREACH grp_dep GENERATE group AS depno, MAX(emp_basic.salaire) AS max_dep_sal;
+jointure_top = JOIN emp_basic BY depno, dep_max BY depno;
+selection_top = FILTER jointure_top BY emp_basic::salaire == dep_max::max_dep_sal;
+projection_top = FOREACH selection_top GENERATE emp_basic::depno AS depno,
+                                                                                        emp_basic::emp_id AS id,
+                                                                                        emp_basic::nom_complet AS nom,
+                                                                                        emp_basic::salaire AS salaire;
+STORE projection_top INTO '$OUTPUT/top_dep' USING PigStorage('\t');
 
--- Nombre total d'employés
-total_grp = GROUP employees ALL;
-total_emp = FOREACH total_grp GENERATE COUNT(employees) AS total_employees;
-STORE total_emp INTO '$OUTPUT/total_emp' USING PigStorage('\t');
+-- Départements sans aucun employé (LEFT JOIN + IS NULL)
+dep_present = DISTINCT (FOREACH emp_basic GENERATE depno);
+dept_left = JOIN dept_only BY depno LEFT, dep_present BY depno;
+dept_vides = FILTER dept_left BY dep_present::depno IS NULL;
+dept_vides_out = FOREACH dept_vides GENERATE dept_only::depno AS depno, dept_only::dep_nom AS dep_nom;
+STORE dept_vides_out INTO '$OUTPUT/dep_empty' USING PigStorage('\t');
 
--- Employés basés à Paris
-paris_emp = FILTER employees BY UPPER(city) == 'PARIS';
-STORE paris_emp INTO '$OUTPUT/paris_emp' USING PigStorage('\t');
+-- Total global d'employés
+grp_all = GROUP emp_basic ALL;
+nb_total = FOREACH grp_all GENERATE COUNT(emp_basic) AS total_employees;
+STORE nb_total INTO '$OUTPUT/total_emp' USING PigStorage('\t');
+
+-- Employés dont la ville (normalisée) = PARIS
+paris_emps = FILTER emp_basic BY UPPER(ville) == 'PARIS';
+STORE paris_emps INTO '$OUTPUT/paris_emp' USING PigStorage('\t');
 
 -- Somme des salaires par ville
-by_city = GROUP employees BY city;
-sum_city = FOREACH by_city GENERATE group AS city, SUM(employees.salary) AS total_salary;
-STORE sum_city INTO '$OUTPUT/sum_city' USING PigStorage('\t');
+grp_ville = GROUP emp_basic BY ville;
+sal_ville = FOREACH grp_ville GENERATE group AS ville, SUM(emp_basic.salaire) AS sal_total;
+STORE sal_ville INTO '$OUTPUT/sum_city' USING PigStorage('\t');
 
--- Départements avec au moins une employée (F)
-ef = FILTER employees BY UPPER(gender) == 'F';
-ef_deps = DISTINCT (FOREACH ef GENERATE depno);
-ef_deps_named = JOIN ef_deps BY depno, departments BY depno;
-employes_femmes = FOREACH ef_deps_named GENERATE departments::depno AS depno, departments::dep_name AS dep_name;
-STORE employes_femmes INTO '$OUTPUT/employes_femmes' USING PigStorage('\t');
+-- Départements contenant au moins une employée (F)
+emp_f = FILTER emp_basic BY UPPER(sexe) == 'F';
+dep_f = DISTINCT (FOREACH emp_f GENERATE depno);
+dep_f_named = JOIN dep_f BY depno, dept_only BY depno;
+deps_emp_f = FOREACH dep_f_named GENERATE dept_only::depno AS depno, dept_only::dep_nom AS dep_nom;
+STORE deps_emp_f INTO '$OUTPUT/employes_femmes' USING PigStorage('\t');

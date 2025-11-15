@@ -4,136 +4,126 @@
 %default AIRPORTS '/user/root/input/flights/airports.csv';
 %default OUTDIR '/user/root/pigout/flights';
 
--- Charger les vols (schéma DataExpo 2009)
-FL_RAW = LOAD '$FLIGHTS' USING PigStorage(',')
-  AS (Year:int, Month:int, DayofMonth:int, DayOfWeek:int,
-      DepTime:int, CRSDepTime:int, ArrTime:int, CRSArrTime:int,
-      UniqueCarrier:chararray, FlightNum:chararray, TailNum:chararray,
-      ActualElapsedTime:int, CRSElapsedTime:int, AirTime:int,
-      ArrDelay:int, DepDelay:int, Origin:chararray, Dest:chararray,
-      Distance:int, TaxiIn:int, TaxiOut:int, Cancelled:int,
-      CancellationCode:chararray, Diverted:int,
-      CarrierDelay:int, WeatherDelay:int, NASDelay:int,
-      SecurityDelay:int, LateAircraftDelay:int);
+-- Ingestion du dataset vols (DataExpo 2009)
+vols_raw = LOAD '$FLIGHTS' USING PigStorage(',') AS (
+  an:int, mois:int, jour:int, jour_semaine:int,
+  heure_dep:int, heure_plan_dep:int, heure_arr:int, heure_plan_arr:int,
+  transporteur:chararray, num_vol:chararray, immatriculation:chararray,
+  tps_total:int, tps_plan:int, tps_air:int,
+  retard_arr:int, retard_dep:int, origine:chararray, destination:chararray,
+  distance:int, taxi_in:int, taxi_out:int, annule:int,
+  code_annulation:chararray, devie:int,
+  retard_transporteur:int, retard_meteo:int, retard_nas:int,
+  retard_securite:int, retard_appareil:int);
 
--- Filtrer les lignes valides (exclut entêtes et codes vides)
-FL = FILTER FL_RAW BY Year IS NOT NULL AND Origin IS NOT NULL AND Dest IS NOT NULL;
+vols = FILTER vols_raw BY an IS NOT NULL AND origine IS NOT NULL AND destination IS NOT NULL;
 
--- Charger les transporteurs (retirer l’en-tête et les guillemets)
-CARR_RAW = LOAD '$CARRIERS' USING PigStorage(',')
-  AS (code:chararray, descr:chararray);
-CARR = FILTER CARR_RAW BY code IS NOT NULL AND UPPER(code) != 'CODE';
-CARR = FOREACH CARR GENERATE REPLACE(code,'"','') AS code, REPLACE(descr,'"','') AS descr;
+-- Transporteurs
+tc_raw = LOAD '$CARRIERS' USING PigStorage(',') AS (code:chararray, libelle:chararray);
+tc_clean = FILTER tc_raw BY code IS NOT NULL AND UPPER(code) != 'CODE';
+tc = FOREACH tc_clean GENERATE REPLACE(code,'"','') AS code, REPLACE(libelle,'"','') AS libelle;
 
--- Charger les aéroports (retirer l’en-tête et les guillemets)
-APT_RAW = LOAD '$AIRPORTS' USING PigStorage(',')
-  AS (iata:chararray, airport:chararray, city:chararray, state:chararray, country:chararray, lat:double, lon:double);
-APT = FILTER APT_RAW BY iata IS NOT NULL AND LOWER(iata) != 'iata';
-APT = FOREACH APT GENERATE
-  REPLACE(iata,'"','') AS iata,
-  REPLACE(airport,'"','') AS airport,
-  REPLACE(city,'"','') AS city,
-  REPLACE(state,'"','') AS state,
-  REPLACE(country,'"','') AS country;
+-- Aéroports
+apt_raw = LOAD '$AIRPORTS' USING PigStorage(',') AS (iata:chararray, aeroport:chararray, ville:chararray, etat:chararray, pays:chararray, lat:double, lon:double);
+apt_f = FILTER apt_raw BY iata IS NOT NULL AND LOWER(iata) != 'iata';
+apt = FOREACH apt_f GENERATE REPLACE(iata,'"','') AS iata,
+                              REPLACE(aeroport,'"','') AS aeroport,
+                              REPLACE(ville,'"','') AS ville,
+                              REPLACE(etat,'"','') AS etat,
+                              REPLACE(pays,'"','') AS pays;
 
--- 1) Top 20 des aéroports (sortants, entrants, total)
-OUT_G = GROUP FL BY Origin;
-OUT_C = FOREACH OUT_G GENERATE group AS iata, COUNT(FL) AS out_cnt;
+-- (1) Top 20 aéroports (sortant / entrant / total)
+grp_out = GROUP vols BY origine;
+stat_out = FOREACH grp_out GENERATE group AS iata, COUNT(vols) AS sortants;
+grp_in = GROUP vols BY destination;
+stat_in = FOREACH grp_in GENERATE group AS iata, COUNT(vols) AS entrants;
+fusion_vol = JOIN stat_out BY iata FULL, stat_in BY iata;
+fusion_calc = FOREACH fusion_vol GENERATE
+  (stat_out::iata IS NOT NULL ? stat_out::iata : stat_in::iata) AS iata,
+  (stat_out::sortants IS NOT NULL ? stat_out::sortants : 0L) AS sortants,
+  (stat_in::entrants IS NOT NULL ? stat_in::entrants : 0L) AS entrants,
+  ((stat_out::sortants IS NOT NULL ? stat_out::sortants : 0L) + (stat_in::entrants IS NOT NULL ? stat_in::entrants : 0L)) AS total;
+fusion_nom = JOIN fusion_calc BY iata LEFT, apt BY iata;
+top_aero = ORDER fusion_nom BY fusion_calc::total DESC;
+top20_aero = LIMIT top_aero 20;
+STORE top20_aero INTO '$OUTDIR/top20_airports' USING PigStorage('\t');
 
-IN_G = GROUP FL BY Dest;
-IN_C = FOREACH IN_G GENERATE group AS iata, COUNT(FL) AS in_cnt;
+-- (1b) Volumes mensuels par aéroport
+grp_out_m = GROUP vols BY (an, mois, origine);
+stat_out_m = FOREACH grp_out_m GENERATE group.an AS an, group.mois AS mois, group.origine AS iata, COUNT(vols) AS sortants;
+grp_in_m = GROUP vols BY (an, mois, destination);
+stat_in_m = FOREACH grp_in_m GENERATE group.an AS an, group.mois AS mois, group.destination AS iata, COUNT(vols) AS entrants;
+fusion_m = JOIN stat_out_m BY (an, mois, iata) FULL, stat_in_m BY (an, mois, iata);
+fusion_m_calc = FOREACH fusion_m GENERATE
+  (stat_out_m::an IS NOT NULL ? stat_out_m::an : stat_in_m::an) AS an,
+  (stat_out_m::mois IS NOT NULL ? stat_out_m::mois : stat_in_m::mois) AS mois,
+  (stat_out_m::iata IS NOT NULL ? stat_out_m::iata : stat_in_m::iata) AS iata,
+  (stat_out_m::sortants IS NOT NULL ? stat_out_m::sortants : 0L) AS sortants,
+  (stat_in_m::entrants IS NOT NULL ? stat_in_m::entrants : 0L) AS entrants,
+  ((stat_out_m::sortants IS NOT NULL ? stat_out_m::sortants : 0L) + (stat_in_m::entrants IS NOT NULL ? stat_in_m::entrants : 0L)) AS total;
+STORE fusion_m_calc INTO '$OUTDIR/airports_monthly' USING PigStorage('\t');
 
-VOL = JOIN OUT_C BY iata FULL, IN_C BY iata;
-VOL_ENR = FOREACH VOL GENERATE
-  (OUT_C::iata IS NOT NULL ? OUT_C::iata : IN_C::iata) AS iata,
-  (OUT_C::out_cnt IS NOT NULL ? OUT_C::out_cnt : 0L) AS out_cnt,
-  (IN_C::in_cnt IS NOT NULL ? IN_C::in_cnt : 0L) AS in_cnt,
-  ((OUT_C::out_cnt IS NOT NULL ? OUT_C::out_cnt : 0L) + (IN_C::in_cnt IS NOT NULL ? IN_C::in_cnt : 0L)) AS total_cnt;
+-- (2) Popularité transporteurs (log10 volume annuel + classement moyenne)
+grp_carrier_year = GROUP vols BY (an, transporteur);
+carrier_year = FOREACH grp_carrier_year GENERATE group.transporteur AS carrier, group.an AS an, COUNT(vols) AS n;
+carrier_year_log = FOREACH carrier_year GENERATE carrier, an, (double)(LOG((double)n)/LOG(10.0)) AS log10_n, n;
+grp_carrier = GROUP carrier_year BY carrier;
+carrier_stats = FOREACH grp_carrier GENERATE group AS carrier, AVG(carrier_year.n) AS moyenne_annuelle;
+carrier_join = JOIN carrier_year_log BY carrier, carrier_stats BY carrier;
+carrier_rank = ORDER carrier_join BY carrier_stats::moyenne_annuelle DESC, carrier_year_log::carrier ASC;
+STORE carrier_rank INTO '$OUTDIR/carriers_popularity' USING PigStorage('\t');
 
-VOL_NAMED = JOIN VOL_ENR BY iata LEFT, APT BY iata;
-TOP_AIRPORTS = ORDER VOL_NAMED BY VOL_ENR::total_cnt DESC;
-TOP20_AIRPORTS = LIMIT TOP_AIRPORTS 20;
-STORE TOP20_AIRPORTS INTO '$OUTDIR/top20_airports' USING PigStorage('\t');
+-- (3) Retards >15 min (heure, jour, jour semaine, mois, année)
+vols_delay = FOREACH vols GENERATE
+  an, mois, jour, jour_semaine,
+  (heure_dep IS NOT NULL ? (int)(heure_dep/100) : (heure_plan_dep IS NOT NULL ? (int)(heure_plan_dep/100) : -1)) AS heure,
+  transporteur AS carrier,
+  (retard_arr IS NOT NULL AND retard_arr > 15 ? 1 : 0) AS est_retard:int;
 
--- 1bis) Volumes par (année, mois, aéroport)
-OUT_M_G = GROUP FL BY (Year, Month, Origin);
-OUT_M = FOREACH OUT_M_G GENERATE group.Year AS year, group.Month AS month, group.Origin AS iata, COUNT(FL) AS out_cnt;
-IN_M_G = GROUP FL BY (Year, Month, Dest);
-IN_M = FOREACH IN_M_G GENERATE group.Year AS year, group.Month AS month, group.Dest AS iata, COUNT(FL) AS in_cnt;
+grp_h = GROUP vols_delay BY heure;
+delay_h = FOREACH grp_h GENERATE group AS heure, AVG(vols_delay.est_retard) AS frac_retard, COUNT(vols_delay) AS n;
+STORE delay_h INTO '$OUTDIR/delay_rate_hour' USING PigStorage('\t');
 
-VOL_M = JOIN OUT_M BY (year, month, iata) FULL, IN_M BY (year, month, iata);
-VOL_M_ENR = FOREACH VOL_M GENERATE
-  (OUT_M::year IS NOT NULL ? OUT_M::year : IN_M::year) AS year,
-  (OUT_M::month IS NOT NULL ? OUT_M::month : IN_M::month) AS month,
-  (OUT_M::iata IS NOT NULL ? OUT_M::iata : IN_M::iata) AS iata,
-  (OUT_M::out_cnt IS NOT NULL ? OUT_M::out_cnt : 0L) AS out_cnt,
-  (IN_M::in_cnt IS NOT NULL ? IN_M::in_cnt : 0L) AS in_cnt,
-  ((OUT_M::out_cnt IS NOT NULL ? OUT_M::out_cnt : 0L) + (IN_M::in_cnt IS NOT NULL ? IN_M::in_cnt : 0L)) AS total_cnt;
-STORE VOL_M_ENR INTO '$OUTDIR/airports_monthly' USING PigStorage('\t');
+grp_d = GROUP vols_delay BY (an, mois, jour);
+delay_d = FOREACH grp_d GENERATE group.an AS an, group.mois AS mois, group.jour AS jour, AVG(vols_delay.est_retard) AS frac_retard, COUNT(vols_delay) AS n;
+STORE delay_d INTO '$OUTDIR/delay_rate_day' USING PigStorage('\t');
 
--- 2) Popularité des transporteurs (log10 du volume annuel, tri par «médiane» ~ moyenne)
-FL_YC_G = GROUP FL BY (Year, UniqueCarrier);
-YC_YEARLY = FOREACH FL_YC_G GENERATE group.UniqueCarrier AS carrier, group.Year AS year, COUNT(FL) AS n;
-YC_YEARLY_LOG = FOREACH YC_YEARLY GENERATE carrier, year, (double)(LOG((double)n)/LOG(10.0)) AS log10_n, n;
+grp_dow = GROUP vols_delay BY jour_semaine;
+delay_dow = FOREACH grp_dow GENERATE group AS jour_semaine, AVG(vols_delay.est_retard) AS frac_retard, COUNT(vols_delay) AS n;
+STORE delay_dow INTO '$OUTDIR/delay_rate_dayofweek' USING PigStorage('\t');
 
-YC_G = GROUP YC_YEARLY BY carrier;
-YC_STATS = FOREACH YC_G GENERATE group AS carrier, AVG(YC_YEARLY.n) AS median_like;
-YC_JOINED = JOIN YC_YEARLY_LOG BY carrier, YC_STATS BY carrier;
-YC_RANKED = ORDER YC_JOINED BY YC_STATS::median_like DESC, YC_YEARLY_LOG::carrier ASC;
-STORE YC_RANKED INTO '$OUTDIR/carriers_popularity' USING PigStorage('\t');
+grp_m = GROUP vols_delay BY (an, mois);
+delay_m = FOREACH grp_m GENERATE group.an AS an, group.mois AS mois, AVG(vols_delay.est_retard) AS frac_retard, COUNT(vols_delay) AS n;
+STORE delay_m INTO '$OUTDIR/delay_rate_month' USING PigStorage('\t');
 
--- 3) Proportion de vols en retard (>15 min) par heure/jour/jour-semaine/mois/année
-FL_DLY = FOREACH FL GENERATE
-  Year, Month, DayofMonth, DayOfWeek,
-  (DepTime IS NOT NULL ? (int)(DepTime/100) : (CRSDepTime IS NOT NULL ? (int)(CRSDepTime/100) : -1)) AS hour,
-  UniqueCarrier AS carrier,
-  (ArrDelay IS NOT NULL AND ArrDelay > 15 ? 1 : 0) AS is_delayed:int;
+grp_y = GROUP vols_delay BY an;
+delay_y = FOREACH grp_y GENERATE group AS an, AVG(vols_delay.est_retard) AS frac_retard, COUNT(vols_delay) AS n;
+STORE delay_y INTO '$OUTDIR/delay_rate_year' USING PigStorage('\t');
 
-G_H = GROUP FL_DLY BY hour;
-DELAY_RATE_H = FOREACH G_H GENERATE group AS hour, AVG(FL_DLY.is_delayed) AS frac_delayed, COUNT(FL_DLY) AS n;
-STORE DELAY_RATE_H INTO '$OUTDIR/delay_rate_hour' USING PigStorage('\t');
+-- (4) Retards agrégés par transporteur (global + mensuel)
+grp_c = GROUP vols_delay BY carrier;
+delay_c = FOREACH grp_c GENERATE group AS carrier, AVG(vols_delay.est_retard) AS frac_retard, COUNT(vols_delay) AS n;
+delay_c_named = JOIN delay_c BY carrier LEFT, tc BY code;
+STORE delay_c_named INTO '$OUTDIR/delay_rate_carrier' USING PigStorage('\t');
 
-G_D = GROUP FL_DLY BY (Year, Month, DayofMonth);
-DELAY_RATE_D = FOREACH G_D GENERATE group.Year AS year, group.Month AS month, group.DayofMonth AS day, AVG(FL_DLY.is_delayed) AS frac_delayed, COUNT(FL_DLY) AS n;
-STORE DELAY_RATE_D INTO '$OUTDIR/delay_rate_day' USING PigStorage('\t');
+grp_c_m = GROUP vols_delay BY (carrier, an, mois);
+delay_c_m = FOREACH grp_c_m GENERATE group.carrier AS carrier, group.an AS an, group.mois AS mois, AVG(vols_delay.est_retard) AS frac_retard, COUNT(vols_delay) AS n;
+STORE delay_c_m INTO '$OUTDIR/delay_rate_carrier_month' USING PigStorage('\t');
 
-G_DOW = GROUP FL_DLY BY DayOfWeek;
-DELAY_RATE_DOW = FOREACH G_DOW GENERATE group AS day_of_week, AVG(FL_DLY.is_delayed) AS frac_delayed, COUNT(FL_DLY) AS n;
-STORE DELAY_RATE_DOW INTO '$OUTDIR/delay_rate_dayofweek' USING PigStorage('\t');
-
-G_MO = GROUP FL_DLY BY (Year, Month);
-DELAY_RATE_MO = FOREACH G_MO GENERATE group.Year AS year, group.Month AS month, AVG(FL_DLY.is_delayed) AS frac_delayed, COUNT(FL_DLY) AS n;
-STORE DELAY_RATE_MO INTO '$OUTDIR/delay_rate_month' USING PigStorage('\t');
-
-G_Y = GROUP FL_DLY BY Year;
-DELAY_RATE_Y = FOREACH G_Y GENERATE group AS year, AVG(FL_DLY.is_delayed) AS frac_delayed, COUNT(FL_DLY) AS n;
-STORE DELAY_RATE_Y INTO '$OUTDIR/delay_rate_year' USING PigStorage('\t');
-
--- 4) Retards par transporteur (global + par mois)
-G_C = GROUP FL_DLY BY carrier;
-DELAY_RATE_C = FOREACH G_C GENERATE group AS carrier, AVG(FL_DLY.is_delayed) AS frac_delayed, COUNT(FL_DLY) AS n;
-DELAY_RATE_C_NAMED = JOIN DELAY_RATE_C BY carrier LEFT, CARR BY code;
-STORE DELAY_RATE_C_NAMED INTO '$OUTDIR/delay_rate_carrier' USING PigStorage('\t');
-
-G_C_MO = GROUP FL_DLY BY (carrier, Year, Month);
-DELAY_RATE_C_MO = FOREACH G_C_MO GENERATE group.carrier AS carrier, group.Year AS year, group.Month AS month, AVG(FL_DLY.is_delayed) AS frac_delayed, COUNT(FL_DLY) AS n;
-STORE DELAY_RATE_C_MO INTO '$OUTDIR/delay_rate_carrier_month' USING PigStorage('\t');
-
--- 5) Itinéraires les plus fréquentés (paire non ordonnée)
-ROUTES = FOREACH FL GENERATE
-  (Origin <= Dest ? Origin : Dest) AS a1,
-  (Origin <= Dest ? Dest : Origin) AS a2;
-G_R = GROUP ROUTES BY (a1, a2);
-ROUTE_FREQ = FOREACH G_R GENERATE group.a1 AS a1, group.a2 AS a2, COUNT(ROUTES) AS n;
-ROUTE_FREQ_N = ORDER ROUTE_FREQ BY n DESC;
-TOP_ROUTES = LIMIT ROUTE_FREQ_N 50;
-
-R_A1 = JOIN TOP_ROUTES BY a1 LEFT, APT BY iata;
-R_A2 = JOIN R_A1 BY TOP_ROUTES::a2 LEFT, APT BY iata;
-ROUTES_NAMED = FOREACH R_A2 GENERATE
-  R_A1::TOP_ROUTES::a1 AS a1,
-  R_A1::TOP_ROUTES::a2 AS a2,
-  R_A1::TOP_ROUTES::n AS n,
-  R_A1::APT::airport AS a1_name,
-  APT::airport AS a2_name;
-STORE ROUTES_NAMED INTO '$OUTDIR/top_routes' USING PigStorage('\t');
+-- (5) Itinéraires les plus fréquentés (paire non ordonnée normalisée)
+routes = FOREACH vols GENERATE
+  (origine <= destination ? origine : destination) AS a1,
+  (origine <= destination ? destination : origine) AS a2;
+grp_route = GROUP routes BY (a1, a2);
+route_freq = FOREACH grp_route GENERATE group.a1 AS a1, group.a2 AS a2, COUNT(routes) AS n;
+route_freq_ord = ORDER route_freq BY n DESC;
+top_routes = LIMIT route_freq_ord 50;
+rt_a1 = JOIN top_routes BY a1 LEFT, apt BY iata;
+rt_a2 = JOIN rt_a1 BY top_routes::a2 LEFT, apt BY iata;
+routes_nom = FOREACH rt_a2 GENERATE
+  rt_a1::top_routes::a1 AS a1,
+  rt_a1::top_routes::a2 AS a2,
+  rt_a1::top_routes::n AS n,
+  rt_a1::apt::aeroport AS a1_nom,
+  apt::aeroport AS a2_nom;
+STORE routes_nom INTO '$OUTDIR/top_routes' USING PigStorage('\t');
